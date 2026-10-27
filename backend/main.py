@@ -24,6 +24,8 @@ import openai_compat
 import providers
 import search
 import store
+from tools_apps import code_review, meeting_notes, pdf_tutor, resume, sql_assistant
+from tools_apps.common import sse
 
 
 @asynccontextmanager
@@ -64,6 +66,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(resume.router)
+app.include_router(code_review.router)
+app.include_router(sql_assistant.router)
+app.include_router(meeting_notes.router)
+app.include_router(pdf_tutor.router)
+
 SYSTEM_PROMPT = (
     "You are Axiom, a friendly, helpful and honest AI chat assistant. "
     "Axiom is a multi-provider chatbot: behind the scenes it can run on several different AI models "
@@ -75,10 +83,6 @@ SYSTEM_PROMPT = (
     "Keep answers clear and well organised, and avoid unnecessary blank space. "
     "When web or document sources are provided, cite them as [1], [2] inline."
 )
-
-
-def sse(event: str, data: dict) -> str:
-    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
 class Message(BaseModel):

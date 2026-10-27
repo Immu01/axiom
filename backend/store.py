@@ -1,6 +1,7 @@
 """SQLite persistence for quotas, API keys, shares, vault, RAG, and routing stats."""
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import threading
@@ -60,6 +61,27 @@ def _connect() -> sqlite3.Connection:
             created REAL NOT NULL
         );
         CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(name, text, content='docs', content_rowid='id');
+        CREATE TABLE IF NOT EXISTS pdf_docs (
+            id TEXT PRIMARY KEY,
+            owner TEXT NOT NULL,
+            name TEXT NOT NULL,
+            created REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS pdf_docs_owner_idx ON pdf_docs(owner);
+        CREATE TABLE IF NOT EXISTS pdf_chunks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            doc_id TEXT NOT NULL REFERENCES pdf_docs(id) ON DELETE CASCADE,
+            owner TEXT NOT NULL,
+            page INTEGER NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            vector TEXT,
+            UNIQUE(doc_id, page, chunk_index)
+        );
+        CREATE INDEX IF NOT EXISTS pdf_chunks_owner_idx ON pdf_chunks(owner, doc_id);
+        CREATE VIRTUAL TABLE IF NOT EXISTS pdf_chunks_fts USING fts5(
+            doc_id UNINDEXED, owner UNINDEXED, name, page UNINDEXED, chunk_index UNINDEXED, text
+        );
         CREATE TABLE IF NOT EXISTS latency (
             provider TEXT NOT NULL,
             model TEXT NOT NULL,
@@ -77,6 +99,7 @@ def _connect() -> sqlite3.Connection:
         if column not in columns:
             _db.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT NOT NULL DEFAULT 'legacy'")
     _db.execute("CREATE INDEX IF NOT EXISTS docs_owner_idx ON docs(owner)")
+    _db.execute("PRAGMA foreign_keys=ON")
     _db.commit()
     return _db
 
@@ -260,6 +283,240 @@ def rag_search(owner: str, query: str, n: int = 5) -> list[dict]:
         except sqlite3.OperationalError:
             return []
         return [dict(r) for r in rows]
+
+
+def create_pdf_document(owner: str, doc_id: str, name: str) -> None:
+    with _lock:
+        db = _connect()
+        db.execute(
+            "INSERT INTO pdf_docs(id, owner, name, created) VALUES (?,?,?,?)",
+            (doc_id, owner, name[:120], time.time()),
+        )
+        db.commit()
+
+
+def add_pdf_chunks(owner: str, doc_id: str, chunks: list[dict]) -> int:
+    with _lock:
+        db = _connect()
+        document = db.execute(
+            "SELECT name FROM pdf_docs WHERE id=? AND owner=?", (doc_id, owner)
+        ).fetchone()
+        if not document:
+            return 0
+        inserted = 0
+        try:
+            for chunk in chunks:
+                vector = chunk.get("vector")
+                cur = db.execute(
+                    "INSERT INTO pdf_chunks(doc_id, owner, page, chunk_index, text, vector) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (
+                        doc_id,
+                        owner,
+                        int(chunk["page"]),
+                        int(chunk["chunk_index"]),
+                        str(chunk["text"]),
+                        json.dumps(vector) if vector is not None else None,
+                    ),
+                )
+                db.execute(
+                    "INSERT INTO pdf_chunks_fts(rowid, doc_id, owner, name, page, chunk_index, text) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    (
+                        cur.lastrowid,
+                        doc_id,
+                        owner,
+                        document["name"],
+                        int(chunk["page"]),
+                        int(chunk["chunk_index"]),
+                        str(chunk["text"]),
+                    ),
+                )
+                inserted += 1
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        return inserted
+
+
+def list_pdf_documents(owner: str) -> list[dict]:
+    with _lock:
+        rows = _connect().execute(
+            "SELECT d.id, d.name, d.created, COUNT(c.id) AS chunks "
+            "FROM pdf_docs d LEFT JOIN pdf_chunks c ON c.doc_id=d.id AND c.owner=d.owner "
+            "WHERE d.owner=? GROUP BY d.id ORDER BY d.created DESC",
+            (owner,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def get_pdf_document(owner: str, doc_id: str) -> dict | None:
+    with _lock:
+        row = _connect().execute(
+            "SELECT id, name, created FROM pdf_docs WHERE owner=? AND id=?",
+            (owner, doc_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_pdf_chunks(owner: str, doc_id: str | None = None) -> list[dict]:
+    with _lock:
+        db = _connect()
+        if doc_id is None:
+            rows = db.execute(
+                "SELECT c.id, c.doc_id, d.name, c.page, c.chunk_index, c.text, c.vector "
+                "FROM pdf_chunks c JOIN pdf_docs d ON d.id=c.doc_id AND d.owner=c.owner "
+                "WHERE c.owner=? ORDER BY d.created, c.page, c.chunk_index",
+                (owner,),
+            ).fetchall()
+        else:
+            rows = db.execute(
+                "SELECT c.id, c.doc_id, d.name, c.page, c.chunk_index, c.text, c.vector "
+                "FROM pdf_chunks c JOIN pdf_docs d ON d.id=c.doc_id AND d.owner=c.owner "
+                "WHERE c.owner=? AND c.doc_id=? ORDER BY c.page, c.chunk_index",
+                (owner, doc_id),
+            ).fetchall()
+        return [
+            {**dict(row), "vector": json.loads(row["vector"]) if row["vector"] else None}
+            for row in rows
+        ]
+
+
+def set_pdf_vectors(owner: str, doc_id: str, vectors: list[list[float] | None]) -> None:
+    with _lock:
+        db = _connect()
+        rows = db.execute(
+            "SELECT id FROM pdf_chunks WHERE owner=? AND doc_id=? ORDER BY page, chunk_index",
+            (owner, doc_id),
+        ).fetchall()
+        if len(rows) != len(vectors):
+            raise ValueError("Vector count does not match the stored PDF chunks.")
+        try:
+            db.executemany(
+                "UPDATE pdf_chunks SET vector=? WHERE id=? AND owner=?",
+                [
+                    (json.dumps(vector) if vector is not None else None, row["id"], owner)
+                    for row, vector in zip(rows, vectors)
+                ],
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+
+
+def delete_pdf_document(owner: str, doc_id: str) -> bool:
+    with _lock:
+        db = _connect()
+        rows = db.execute(
+            "SELECT id FROM pdf_chunks WHERE owner=? AND doc_id=?", (owner, doc_id)
+        ).fetchall()
+        if not rows:
+            exists = db.execute(
+                "SELECT 1 FROM pdf_docs WHERE owner=? AND id=?", (owner, doc_id)
+            ).fetchone()
+            if not exists:
+                return False
+        try:
+            db.executemany("DELETE FROM pdf_chunks_fts WHERE rowid=?", [(row["id"],) for row in rows])
+            db.execute("DELETE FROM pdf_chunks WHERE owner=? AND doc_id=?", (owner, doc_id))
+            db.execute("DELETE FROM pdf_docs WHERE owner=? AND id=?", (owner, doc_id))
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        return True
+
+
+def pdf_hybrid_search(
+    owner: str,
+    query: str,
+    query_vector: list[float] | None,
+    n: int = 6,
+    doc_ids: list[str] | None = None,
+) -> list[dict]:
+    import re
+
+    with _lock:
+        db = _connect()
+        all_rows = db.execute(
+            "SELECT c.id, c.doc_id, d.name, c.page, c.chunk_index, c.text, c.vector "
+            "FROM pdf_chunks c JOIN pdf_docs d ON d.id=c.doc_id AND d.owner=c.owner "
+            "WHERE c.owner=? ORDER BY c.id",
+            (owner,),
+        ).fetchall()
+        rows = [
+            {**dict(row), "vector": json.loads(row["vector"]) if row["vector"] else None}
+            for row in all_rows
+            if doc_ids is None or row["doc_id"] in doc_ids
+        ]
+        if not rows:
+            return []
+
+        query_words = list(dict.fromkeys(re.findall(r"[\w]+", query.lower())))
+        fts_rows: list[sqlite3.Row] = []
+        if query_words:
+            fts_query = " OR ".join(f'"{word.replace(chr(34), "")}"' for word in query_words[:32])
+            try:
+                sql = (
+                    "SELECT rowid FROM pdf_chunks_fts WHERE pdf_chunks_fts MATCH ? AND owner=? "
+                )
+                params: list = [fts_query, owner]
+                if doc_ids is not None:
+                    placeholders = ",".join("?" for _ in doc_ids)
+                    sql += f" AND doc_id IN ({placeholders})"
+                    params.extend(doc_ids)
+                sql += " ORDER BY bm25(pdf_chunks_fts)"
+                fts_rows = db.execute(sql, params).fetchall()
+            except sqlite3.OperationalError:
+                fts_rows = []
+
+    by_id = {int(row["id"]): row for row in rows}
+    ranks: dict[int, float] = {}
+    fts_rank = {int(row["rowid"]): rank for rank, row in enumerate(fts_rows, 1)}
+    vector_rank: dict[int, tuple[int, float]] = {}
+    if query_vector:
+        qnorm = math.sqrt(sum(float(value) ** 2 for value in query_vector))
+        if qnorm:
+            similarities = []
+            for row in rows:
+                vector = row["vector"]
+                if not vector or len(vector) != len(query_vector):
+                    continue
+                vector_norm = math.sqrt(sum(float(value) ** 2 for value in vector))
+                if not vector_norm:
+                    continue
+                score = sum(
+                    float(value) * float(query_value)
+                    for value, query_value in zip(vector, query_vector)
+                ) / (vector_norm * qnorm)
+                similarities.append((int(row["id"]), score))
+            similarities.sort(key=lambda item: item[1], reverse=True)
+            vector_rank = {
+                chunk_id: (rank, score)
+                for rank, (chunk_id, score) in enumerate(similarities, 1)
+            }
+
+    for chunk_id in by_id:
+        if chunk_id not in fts_rank and chunk_id not in vector_rank:
+            continue
+        score = 0.0
+        if chunk_id in fts_rank:
+            score += 1.0 / (60 + fts_rank[chunk_id])
+        if chunk_id in vector_rank:
+            score += 1.0 / (60 + vector_rank[chunk_id][0])
+        ranks[chunk_id] = score
+    ordered = sorted(ranks, key=ranks.get, reverse=True)[:n]
+    return [
+        {
+            **{key: value for key, value in by_id[chunk_id].items() if key != "vector"},
+            "score": ranks[chunk_id],
+            "similarity": vector_rank.get(chunk_id, (0, 0.0))[1],
+            "fts_rank": fts_rank.get(chunk_id),
+        }
+        for chunk_id in ordered
+    ]
 
 
 def record_latency(provider: str, model: str, ms: float) -> None:

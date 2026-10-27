@@ -24,6 +24,9 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+MAX_TOOL_BODY_BYTES = _int_env("MAX_TOOL_BODY_MB", 4) * 1024 * 1024
+
+
 def client_key(request: Request) -> str:
     """Who is calling? Uses the socket address, or X-Forwarded-For only if TRUST_PROXY=1."""
     if os.getenv("TRUST_PROXY", "") == "1":
@@ -71,6 +74,13 @@ chat_limiter = RateLimiter(_int_env("RATE_LIMIT_CHAT", 20))
 title_limiter = RateLimiter(_int_env("RATE_LIMIT_TITLE", 30))
 extract_limiter = RateLimiter(_int_env("RATE_LIMIT_EXTRACT", 10))
 admin_limiter = RateLimiter(_int_env("RATE_LIMIT_ADMIN", 30))
+tool_limiters = {
+    "resume": RateLimiter(_int_env("RATE_LIMIT_TOOL_RESUME", 10)),
+    "code_review": RateLimiter(_int_env("RATE_LIMIT_TOOL_CODE_REVIEW", 10)),
+    "sql_assistant": RateLimiter(_int_env("RATE_LIMIT_TOOL_SQL_ASSISTANT", 15)),
+    "meeting": RateLimiter(_int_env("RATE_LIMIT_TOOL_MEETING", 10)),
+    "pdf": RateLimiter(_int_env("RATE_LIMIT_TOOL_PDF", 10)),
+}
 
 
 def chat_limit(request: Request) -> None:
@@ -83,6 +93,18 @@ def title_limit(request: Request) -> None:
 
 def extract_limit(request: Request) -> None:
     extract_limiter.check(client_key(request))
+
+
+def tool_limit(tool: str):
+    """Create a per-client rate-limit dependency for one built-in AI tool."""
+    limiter = tool_limiters.get(tool)
+    if limiter is None:
+        raise ValueError(f"Unknown tool rate limiter: {tool}")
+
+    def dependency(request: Request) -> None:
+        limiter.check(client_key(request))
+
+    return dependency
 
 
 def body_limit(max_bytes: int):
@@ -98,3 +120,5 @@ def body_limit(max_bytes: int):
 
 chat_body = body_limit(MAX_CHAT_BODY_BYTES)
 extract_body = body_limit(MAX_EXTRACT_BODY_BYTES)
+tool_body = body_limit(MAX_TOOL_BODY_BYTES)
+pdf_body = body_limit(_int_env("MAX_PDF_BODY_MB", 50) * 1024 * 1024)

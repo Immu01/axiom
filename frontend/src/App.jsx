@@ -57,14 +57,25 @@ import {
   onVoicesChanged,
 } from "./voice";
 import { parseThink } from "./parseThink";
+import ResumeTool from "./tools/ResumeTool.jsx";
+import CodeReviewTool from "./tools/CodeReviewTool.jsx";
+import SQLAssistantTool from "./tools/SQLAssistantTool.jsx";
+import MeetingNotesTool from "./tools/MeetingNotesTool.jsx";
+import PdfTutorTool from "./tools/PdfTutorTool.jsx";
 
 const API_URL = (import.meta.env.VITE_API_URL || "http://127.0.0.1:8000").replace(/\/+$/, "");
-const ADMIN_TOKEN = import.meta.env.VITE_ADMIN_TOKEN || "";
-const ENV_API_KEY = import.meta.env.VITE_AXIOM_API_KEY || "";
+const TOOL_ITEMS = [
+  { id: "chat", label: "Chat", icon: Bot },
+  { id: "resume", label: "Resume Analyzer", icon: FileText },
+  { id: "code-review", label: "Code Review", icon: Code },
+  { id: "sql", label: "SQL Assistant", icon: Columns2 },
+  { id: "meeting", label: "Meeting Notes", icon: PenLine },
+  { id: "pdf", label: "PDF Tutor", icon: Search },
+];
 
-function adminHeaders() {
+function adminHeaders(token) {
   const h = {};
-  if (ADMIN_TOKEN) h["X-Admin-Token"] = ADMIN_TOKEN;
+  if (token) h["X-Admin-Token"] = token;
   return h;
 }
 const STORAGE_KEY = "axiom.chats.v1";
@@ -325,7 +336,15 @@ function Pre({ children }) {
           <span>{copied ? "Copied" : "Copy code"}</span>
         </button>
       </div>
-      <pre ref={ref}>{children}</pre>
+      <pre ref={ref} tabIndex={0} aria-label={`${lang} code sample`}>{children}</pre>
+    </div>
+  );
+}
+
+function MarkdownTable({ children, ...props }) {
+  return (
+    <div className="markdown-table-scroll" role="region" aria-label="Scrollable table" tabIndex={0}>
+      <table {...props}>{children}</table>
     </div>
   );
 }
@@ -360,6 +379,7 @@ function AssistantContent({ content, streaming, onPreviewArtifact }) {
             onClick={() => setOpen((v) => !v)}
             onKeyDown={(e) => onActivate(e, () => setOpen((v) => !v))}
             role="button"
+            aria-expanded={open}
             tabIndex={0}
           >
             <div className="thinking-title">
@@ -392,7 +412,7 @@ function AssistantContent({ content, streaming, onPreviewArtifact }) {
             <ReactMarkdown
               remarkPlugins={[remarkGfm]}
               rehypePlugins={[rehypeHighlight]}
-              components={{ pre: Pre }}
+              components={{ pre: Pre, table: MarkdownTable }}
             >
               {displayAnswer}
             </ReactMarkdown>
@@ -401,7 +421,7 @@ function AssistantContent({ content, streaming, onPreviewArtifact }) {
       ) : (
         streaming &&
         !thinking && (
-          <div className="typing-indicator" aria-label="Axiom is thinking">
+          <div className="typing-indicator" role="status" aria-live="polite" aria-label="Axiom is thinking">
             <span />
             <span />
             <span />
@@ -524,8 +544,12 @@ export default function App() {
   const [artifactHtml, setArtifactHtml] = useState("");
   const [showArtifact, setShowArtifact] = useState(false);
   const [syncPassphrase, setSyncPassphrase] = useState("");
+  const [adminToken, setAdminToken] = useState("");
   const [handsFree, setHandsFree] = useState(Boolean(settings.handsFree));
+  const [activeTool, setActiveTool] = useState("chat");
   const newChatRef = useRef(() => {});
+  const dialogRef = useRef(null);
+  const focusReturnRef = useRef(null);
 
   const bottomRef = useRef(null);
   const chatRef = useRef(null);
@@ -540,6 +564,39 @@ export default function App() {
   const modelMenuRef = useRef(null);
   const handsFreeRef = useRef(Boolean(settings.handsFree));
   const voiceTextRef = useRef("");
+  const dialogOpen = showSettings || showStatus || showArtifact;
+
+  useEffect(() => {
+    if (dialogOpen) {
+      if (!focusReturnRef.current) focusReturnRef.current = document.activeElement;
+      requestAnimationFrame(() => dialogRef.current?.focus());
+      return;
+    }
+    focusReturnRef.current?.focus?.();
+    focusReturnRef.current = null;
+  }, [dialogOpen]);
+
+  function keepDialogFocus(event) {
+    if (event.key !== "Tab") return;
+    const dialog = event.currentTarget;
+    const focusable = [...(dialog?.querySelectorAll(
+      'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+    ) || [])].filter((element) => element.getClientRects().length > 0);
+    if (!focusable.length) {
+      event.preventDefault();
+      dialog?.focus();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && (document.activeElement === first || document.activeElement === dialog)) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
 
   useEffect(() => {
     handsFreeRef.current = handsFree;
@@ -589,6 +646,9 @@ export default function App() {
 
   const activeChat = chats.find((c) => c.id === activeId);
   const messages = activeChat ? activeChat.messages : EMPTY_MSGS;
+  const workspaceTitle = activeTool === "chat"
+    ? activeChat?.title || "New chat"
+    : TOOL_ITEMS.find((item) => item.id === activeTool)?.label || "Axiom";
 
   // Theme, text size, voice
   useEffect(() => {
@@ -732,6 +792,7 @@ export default function App() {
       if (e.key === "Escape") {
         setShowSettings(false);
         setShowStatus(false);
+        setShowArtifact(false);
         setShowModelMenu(false);
         setMenuOpen(false);
         setRenamingId(null);
@@ -744,10 +805,15 @@ export default function App() {
   // Status polling
   useEffect(() => {
     if (!showStatus) return;
+    if (!adminToken.trim()) {
+      setStats(null);
+      setStatsError(false);
+      return;
+    }
     let alive = true;
     async function load() {
       try {
-        const res = await fetch(`${API_URL}/api/stats`, { headers: adminHeaders() });
+        const res = await fetch(`${API_URL}/api/stats`, { headers: adminHeaders(adminToken) });
         if (!res.ok) throw new Error("bad");
         const data = await res.json();
         if (alive) {
@@ -764,13 +830,13 @@ export default function App() {
       alive = false;
       clearInterval(timer);
     };
-  }, [showStatus]);
+  }, [adminToken, showStatus]);
 
   useEffect(() => {
     if (!showModelMenu) return;
     let active = true;
     const headers = {};
-    const apiKey = settings.apiKey || ENV_API_KEY;
+    const apiKey = settings.apiKey;
     if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
     fetch(`${API_URL}/api/models`, { headers })
       .then((res) => {
@@ -863,7 +929,7 @@ export default function App() {
 
   function authHeaders(json = true) {
     const h = json ? { "Content-Type": "application/json" } : {};
-    const key = settings.apiKey || ENV_API_KEY;
+    const key = settings.apiKey;
     if (key) h.Authorization = `Bearer ${key}`;
     return h;
   }
@@ -1083,6 +1149,7 @@ export default function App() {
   }
 
   function newChat() {
+    setActiveTool("chat");
     stopSpeaking();
     setMenuOpen(false);
     setEditing(null);
@@ -1403,10 +1470,10 @@ export default function App() {
   async function adminPost(path) {
     const res = await fetch(`${API_URL}${path}`, {
       method: "POST",
-      headers: { "X-Admin-Token": ADMIN_TOKEN },
+      headers: adminHeaders(adminToken),
     });
     if (!res.ok) {
-      notify("Chaos controls are locked. Set ADMIN_TOKEN (backend/.env) and VITE_ADMIN_TOKEN (frontend/.env.local).");
+      notify("Chaos controls are locked. Configure ADMIN_TOKEN in the backend and enter it in Settings.");
       return false;
     }
     return true;
@@ -1415,7 +1482,7 @@ export default function App() {
   async function triggerFail(provider) {
     try {
       await adminPost(`/api/debug/fail/${provider}`);
-      const res = await fetch(`${API_URL}/api/stats`, { headers: adminHeaders() });
+      const res = await fetch(`${API_URL}/api/stats`, { headers: adminHeaders(adminToken) });
       if (res.ok) setStats(await res.json());
     } catch {
       /* ignore */
@@ -1425,7 +1492,7 @@ export default function App() {
   async function triggerBreak(provider, n = 18) {
     try {
       await adminPost(`/api/debug/break/${provider}/${n}`);
-      const res = await fetch(`${API_URL}/api/stats`, { headers: adminHeaders() });
+      const res = await fetch(`${API_URL}/api/stats`, { headers: adminHeaders(adminToken) });
       if (res.ok) setStats(await res.json());
     } catch {
       /* ignore */
@@ -1435,7 +1502,7 @@ export default function App() {
   async function triggerClear() {
     try {
       await adminPost("/api/debug/clear");
-      const res = await fetch(`${API_URL}/api/stats`, { headers: adminHeaders() });
+      const res = await fetch(`${API_URL}/api/stats`, { headers: adminHeaders(adminToken) });
       if (res.ok) setStats(await res.json());
     } catch {
       /* ignore */
@@ -1628,9 +1695,12 @@ export default function App() {
       {menuOpen && <div className="backdrop" onClick={() => setMenuOpen(false)} />}
 
       {/* Modern Sidebar (Claude & ChatGPT Style) */}
-      <aside className={`sidebar ${menuOpen ? "open" : ""} ${collapsed ? "collapsed" : ""}`}>
+      <aside
+        className={`sidebar ${menuOpen ? "open" : ""} ${collapsed ? "collapsed" : ""}`}
+        aria-label="Workspace sidebar"
+      >
         <div className="sidebar-header">
-          <div className="brand" onClick={newChat} onKeyDown={(e) => onActivate(e, newChat)} role="button" tabIndex={0}>
+          <div className="brand" onClick={newChat} onKeyDown={(e) => onActivate(e, newChat)} role="button" tabIndex={0} aria-label="Axiom, new chat" title="Axiom">
             <span className="logo">
               <Sparkles size={16} />
             </span>
@@ -1639,62 +1709,86 @@ export default function App() {
           <button
             className="iconbtn"
             onClick={toggleSidebar}
-            title="Close sidebar (⌘B)"
-            aria-label="Close sidebar"
+            title={collapsed ? "Expand sidebar (⌘B)" : "Collapse sidebar (⌘B)"}
+            aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
           >
             <PanelLeft size={18} />
           </button>
         </div>
 
-        <button className="btn-new" onClick={newChat}>
-          <div className="btn-new-left">
-            <Plus size={16} />
-            <span>New chat</span>
-          </div>
-          <kbd className="shortcut-hint">⌘N</kbd>
-        </button>
-
-        <div className="searchwrap">
-          <Search size={14} />
-          <input
-            ref={searchRef}
-            className="searchbox"
-            type="search"
-            placeholder="Search chats..."
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-          />
-          {query && (
-            <button className="search-clear" onClick={() => setQuery("")} aria-label="Clear search">
-              <X size={12} />
+        <nav className="workspace-nav" aria-label="Workspace tools">
+          {TOOL_ITEMS.map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              className={`workspace-nav-item ${activeTool === item.id ? "active" : ""}`}
+              aria-label={item.label}
+              title={collapsed ? item.label : undefined}
+              aria-current={activeTool === item.id ? "page" : undefined}
+              onClick={() => {
+                setActiveTool(item.id);
+                setMenuOpen(false);
+              }}
+            >
+              <item.icon size={16} />
+              <span>{item.label}</span>
             </button>
-          )}
-        </div>
-
-        <div className="chatlist">
-          {filteredChats.length === 0 && (
-            <div className="chatlist-empty">{q ? "No matching chats" : "No conversations yet"}</div>
-          )}
-
-          {/* Pinned section */}
-          {pinnedChats.length > 0 && (
-            <div className="chat-section">
-              <div className="grouplabel">
-                <Pin size={11} />
-                <span>Pinned</span>
-              </div>
-              {pinnedChats.map(renderChatItem)}
-            </div>
-          )}
-
-          {/* Grouped chats */}
-          {dateGroups.map((g) => (
-            <div key={g.label} className="chat-section">
-              <div className="grouplabel">{g.label}</div>
-              {g.items.map(renderChatItem)}
-            </div>
           ))}
-        </div>
+        </nav>
+
+        {activeTool === "chat" && (
+          <>
+            <button className="btn-new" onClick={newChat}>
+              <div className="btn-new-left">
+                <Plus size={16} />
+                <span>New chat</span>
+              </div>
+              <kbd className="shortcut-hint">⌘N</kbd>
+            </button>
+
+            <div className="searchwrap">
+              <Search size={14} />
+              <input
+                ref={searchRef}
+                className="searchbox"
+                type="search"
+                placeholder="Search chats..."
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+              />
+              {query && (
+                <button className="search-clear" onClick={() => setQuery("")} aria-label="Clear search">
+                  <X size={12} />
+                </button>
+              )}
+            </div>
+
+            <div className="chatlist">
+              {filteredChats.length === 0 && (
+                <div className="chatlist-empty">{q ? "No matching chats" : "No conversations yet"}</div>
+              )}
+
+              {/* Pinned section */}
+              {pinnedChats.length > 0 && (
+                <div className="chat-section">
+                  <div className="grouplabel">
+                    <Pin size={11} />
+                    <span>Pinned</span>
+                  </div>
+                  {pinnedChats.map(renderChatItem)}
+                </div>
+              )}
+
+              {/* Grouped chats */}
+              {dateGroups.map((g) => (
+                <div key={g.label} className="chat-section">
+                  <div className="grouplabel">{g.label}</div>
+                  {g.items.map(renderChatItem)}
+                </div>
+              ))}
+            </div>
+          </>
+        )}
 
         {/* Sidebar Footer User Profile Dock */}
         <div className="sidebar-foot">
@@ -1742,22 +1836,24 @@ export default function App() {
         {/* Top Navbar with ChatGPT / Claude Style Model Dropdown */}
         <header className="topbar">
           <div className="topleft">
-            {collapsed && (
-              <button
-                className="iconbtn"
-                onClick={toggleSidebar}
-                title="Open sidebar (⌘B)"
-                aria-label="Open sidebar"
-              >
-                <PanelLeft size={18} />
-              </button>
-            )}
+            <button
+              className="iconbtn sidebar-open-button"
+              onClick={toggleSidebar}
+              title={menuOpen ? "Close sidebar" : "Open workspace navigation"}
+              aria-label={menuOpen ? "Close sidebar" : "Open workspace navigation"}
+            >
+              <PanelLeft size={18} />
+            </button>
 
             {collapsed && (
               <button className="iconbtn" onClick={newChat} title="New chat (⌘N)" aria-label="New chat">
                 <PenLine size={18} />
               </button>
             )}
+
+            <span className="workspace-page-title" title={workspaceTitle}>
+              {workspaceTitle}
+            </span>
 
             {/* Model Selector Pill & Dropdown (ChatGPT style) */}
             <div className="model-selector-wrap" ref={modelMenuRef}>
@@ -1938,19 +2034,38 @@ export default function App() {
         </header>
 
         {/* Chat Area & Message Thread */}
+        {activeTool === "chat" ? (
+          <>
         <div className="chatarea">
           <main className="chat" ref={chatRef} onScroll={onChatScroll}>
             <div className="thread">
               {messages.length === 0 && (
                 <div className="empty-center-container">
                   <div className="empty-hero">
-                    <div className="hero-sparkle">
+                    <div className="hero-axis-mark" aria-hidden="true">
                       <Sparkles size={32} />
                     </div>
                     <h1 className="hero-heading">{getGreeting()}</h1>
                     <p className="hero-subtext">
                       How can Axiom assist your workflow today?
                     </p>
+                  </div>
+
+                  <div className="home-tool-links" role="group" aria-label="Explore Axiom tools">
+                    <p>Explore a tool</p>
+                    <div className="home-tool-link-list">
+                    {TOOL_ITEMS.filter((item) => item.id !== "chat").map((item) => (
+                      <button
+                        key={item.id}
+                        type="button"
+                        className="home-tool-link"
+                        onClick={() => setActiveTool(item.id)}
+                      >
+                        <item.icon size={16} />
+                        <span>{item.label}</span>
+                      </button>
+                    ))}
+                    </div>
                   </div>
 
                   <div className="suggestions-grid">
@@ -2018,6 +2133,7 @@ export default function App() {
                                 <div className="sources-container">
                                   <div
                                     className="sources-bar"
+                                    aria-expanded={isExpanded}
                                     onClick={() =>
                                       setSourcesExpanded((prev) => ({
                                         ...prev,
@@ -2075,7 +2191,7 @@ export default function App() {
                                 <div className="failover-pill">
                                   <Zap size={12} />
                                   <span>
-                                    Rescued by <b>{PROVIDER_NAMES[m.provider] || m.provider}</b> failover — response continued seamlessly.
+                                    Continued with <b>{PROVIDER_NAMES[m.provider] || m.provider}</b> after a provider issue.
                                   </span>
                                 </div>
                               )}
@@ -2197,7 +2313,7 @@ export default function App() {
           </main>
 
           {showJump && (
-            <button className="jump-to-bottom" onClick={scrollToBottom} aria-label="Jump to latest message">
+            <button className="jump-to-bottom" onClick={scrollToBottom} aria-label="Jump to latest message" title="Jump to latest message">
               <ChevronDown size={18} />
             </button>
           )}
@@ -2206,7 +2322,7 @@ export default function App() {
         {/* Iconic Floating Pill Composer (ChatGPT / Claude Style) */}
         <div className="composer-container">
           {micError && <div className="composer-toast">{micError}</div>}
-          <div className="composer-capsule">
+          <div className="composer-capsule" role="group" aria-label="Message composer">
             {pending.length > 0 && (
               <div className="composer-chips">
                 {pending.map((p) => (
@@ -2237,6 +2353,7 @@ export default function App() {
               onKeyDown={onKeyDown}
               onPaste={onPaste}
               placeholder="Ask Axiom anything..."
+              aria-label="Message Axiom"
               rows={1}
             />
 
@@ -2340,14 +2457,24 @@ export default function App() {
           </div>
 
           <div className="composer-disclaimer">
-            Axiom auto-fails over between Groq, Gemini &amp; OpenRouter for uninterrupted responses.
+            Axiom can switch providers if one becomes unavailable.
           </div>
         </div>
+          </>
+        ) : (
+          <div className="tool-stage">
+            {activeTool === "resume" && <ResumeTool apiKey={settings.apiKey} />}
+            {activeTool === "code-review" && <CodeReviewTool apiKey={settings.apiKey} />}
+            {activeTool === "sql" && <SQLAssistantTool apiKey={settings.apiKey} />}
+            {activeTool === "meeting" && <MeetingNotesTool apiKey={settings.apiKey} />}
+            {activeTool === "pdf" && <PdfTutorTool apiKey={settings.apiKey} />}
+          </div>
+        )}
       </div>
 
       {showArtifact && (
         <div className="overlay" onClick={() => setShowArtifact(false)}>
-          <div className="modal artifact-modal" role="dialog" aria-label="Artifact preview" onClick={(e) => e.stopPropagation()}>
+          <div ref={dialogRef} className="modal artifact-modal" role="dialog" aria-modal="true" aria-label="Artifact preview" tabIndex={-1} onKeyDown={keepDialogFocus} onClick={(e) => e.stopPropagation()}>
             <div className="modalhead">
               <div className="modal-title-wrap">
                 <Code size={18} />
@@ -2365,7 +2492,7 @@ export default function App() {
       {/* System Status & Failover Cockpit Modal */}
       {showStatus && (
         <div className="overlay" onClick={() => setShowStatus(false)}>
-          <div className="modal status-modal" role="dialog" aria-label="System status" onClick={(e) => e.stopPropagation()}>
+          <div ref={dialogRef} className="modal status-modal" role="dialog" aria-modal="true" aria-label="System status" tabIndex={-1} onKeyDown={keepDialogFocus} onClick={(e) => e.stopPropagation()}>
             <div className="modalhead">
               <div className="modal-title-wrap">
                 <Cpu size={18} />
@@ -2376,7 +2503,16 @@ export default function App() {
               </button>
             </div>
 
-            {statsError && <div className="hint error-text">Unable to reach Axiom backend server.</div>}
+            {!adminToken.trim() && (
+              <div className="hint" role="status">
+                Add your admin token in Settings to view system status.
+              </div>
+            )}
+            {statsError && (
+              <div className="hint error-text" role="alert">
+                Could not load system status. Check your admin token and try again.
+              </div>
+            )}
 
             {stats && (
               <>
@@ -2476,7 +2612,7 @@ export default function App() {
       {/* Settings Modal */}
       {showSettings && (
         <div className="overlay" onClick={() => setShowSettings(false)}>
-          <div className="modal" role="dialog" aria-label="Settings" onClick={(e) => e.stopPropagation()}>
+          <div ref={dialogRef} className="modal" role="dialog" aria-modal="true" aria-label="Settings" tabIndex={-1} onKeyDown={keepDialogFocus} onClick={(e) => e.stopPropagation()}>
             <div className="modalhead">
               <div className="modal-title-wrap">
                 <Sliders size={18} />
@@ -2487,8 +2623,7 @@ export default function App() {
               </button>
             </div>
 
-            <div className="fieldlabel">Interface Theme</div>
-            <div className="seg">
+            <div className="seg" role="group" aria-label="Interface theme">
               {[
                 ["dark", "Dark", Moon],
                 ["light", "Light", Sun],
@@ -2497,6 +2632,7 @@ export default function App() {
                 <button
                   key={key}
                   className={settings.theme === key ? "on" : ""}
+                  aria-pressed={settings.theme === key}
                   onClick={() => updateSetting("theme", key)}
                 >
                   <Icon size={15} />
@@ -2505,8 +2641,7 @@ export default function App() {
               ))}
             </div>
 
-            <div className="fieldlabel">Typography Size</div>
-            <div className="seg">
+            <div className="seg" role="group" aria-label="Typography size">
               {[
                 ["small", "Compact"],
                 ["medium", "Default"],
@@ -2515,6 +2650,7 @@ export default function App() {
                 <button
                   key={key}
                   className={settings.fontSize === key ? "on" : ""}
+                  aria-pressed={settings.fontSize === key}
                   onClick={() => updateSetting("fontSize", key)}
                 >
                   {label}
@@ -2522,8 +2658,9 @@ export default function App() {
               ))}
             </div>
 
-            <div className="fieldlabel">Text-To-Speech Voice</div>
+            <label className="fieldlabel" htmlFor="settings-voice">Text-to-speech voice</label>
             <select
+              id="settings-voice"
               className="voiceselect"
               value={settings.voice}
               onChange={(e) => updateSetting("voice", e.target.value)}
@@ -2536,7 +2673,7 @@ export default function App() {
               ))}
             </select>
 
-            <div className="seg voicespeed">
+            <div className="seg voicespeed" role="group" aria-label="Speech rate">
               {[
                 ["Slower", 0.85],
                 ["Normal", 1],
@@ -2545,6 +2682,7 @@ export default function App() {
                 <button
                   key={label}
                   className={settings.speechRate === rate ? "on" : ""}
+                  aria-pressed={settings.speechRate === rate}
                   onClick={() => updateSetting("speechRate", rate)}
                 >
                   {label}
@@ -2560,8 +2698,9 @@ export default function App() {
               Test Voice Output
             </button>
 
-            <div className="fieldlabel">Custom System Instructions</div>
+            <label className="fieldlabel" htmlFor="settings-instructions">Custom system instructions</label>
             <textarea
+              id="settings-instructions"
               className="instructions"
               value={settings.instructions}
               maxLength={1500}
@@ -2573,8 +2712,9 @@ export default function App() {
               Appended to system prompt with every conversation • {settings.instructions.length}/1500 chars
             </div>
 
-            <div className="fieldlabel">Memory for this chat</div>
+            <label className="fieldlabel" htmlFor="settings-memory">Memory for this chat</label>
             <textarea
+              id="settings-memory"
               className="instructions"
               value={activeChat?.memory ?? settings.memory}
               maxLength={4000}
@@ -2583,8 +2723,9 @@ export default function App() {
               onChange={(e) => updateChatMemory(e.target.value)}
             />
 
-            <div className="fieldlabel">Gateway API key</div>
+            <label className="fieldlabel" htmlFor="settings-api-key">Gateway API key</label>
             <input
+              id="settings-api-key"
               className="voiceselect"
               type="password"
               autoComplete="off"
@@ -2593,6 +2734,18 @@ export default function App() {
               onChange={(e) => updateSetting("apiKey", e.target.value)}
             />
             <div className="hint">Keys remain in memory for this tab and are not written to localStorage.</div>
+
+            <label className="fieldlabel" htmlFor="settings-admin-token">Admin token (optional)</label>
+            <input
+              id="settings-admin-token"
+              className="voiceselect"
+              type="password"
+              autoComplete="off"
+              value={adminToken}
+              placeholder="Required only for admin and failover controls"
+              onChange={(e) => setAdminToken(e.target.value)}
+            />
+            <div className="hint">The admin token stays in this tab’s memory and is never stored in the frontend environment or localStorage.</div>
 
             <div className="fieldlabel">Bring your own provider keys (optional)</div>
             {[
@@ -2605,14 +2758,16 @@ export default function App() {
                 className="voiceselect"
                 type="password"
                 autoComplete="off"
+                aria-label={`${label} provider key`}
                 value={settings[key]}
                 placeholder={label}
                 onChange={(e) => updateSetting(key, e.target.value)}
               />
             ))}
 
-            <div className="fieldlabel">MCP server URL (optional)</div>
+            <label className="fieldlabel" htmlFor="settings-mcp-url">MCP server URL (optional)</label>
             <input
+              id="settings-mcp-url"
               className="voiceselect"
               type="url"
               value={settings.mcpUrl}
@@ -2622,14 +2777,18 @@ export default function App() {
             <div className="hint">MCP servers must use HTTPS and resolve to public IPs unless explicitly allowlisted by the gateway.</div>
 
             <div className="fieldlabel">Encrypted sync</div>
+            <label className="fieldlabel" htmlFor="settings-sync-id">Sync ID</label>
             <input
+              id="settings-sync-id"
               className="voiceselect"
               value={settings.vaultId}
               maxLength={80}
               placeholder="Sync ID"
               onChange={(e) => updateSetting("vaultId", e.target.value)}
             />
+            <label className="fieldlabel" htmlFor="settings-sync-passphrase">Encryption passphrase</label>
             <input
+              id="settings-sync-passphrase"
               className="voiceselect"
               type="password"
               autoComplete="new-password"

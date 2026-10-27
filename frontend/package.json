@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
-    "test": "node src/parseThink.test.js",
+    "test": "node src/parseThink.test.js && node src/tools/api.test.js",
     "preview": "vite preview"
   },
   "dependencies": {
